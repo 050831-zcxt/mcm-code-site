@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>MCM Code Browser</title>
+  <link rel="stylesheet" href="./style.css" />
+
+  <!-- 代码高亮：用 CDN（最省事）。如果你担心评委没网，我下面也给你“离线版”做法。 -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/themes/prism.min.css">
+</head>
+<body>
+  <header class="header">
+    <div class="title">
+      <h1>MCM / IC(M) Code Browser</h1>
+      <p>点击左侧文件树浏览代码（支持分享链接定位文件）。</p>
+    </div>
+    <div class="toolbar">
+      <input id="search" class="search" placeholder="搜索文件名（例如 model / simulation / .py）" />
+      <button id="copyBtn" class="btn" disabled>复制当前文件</button>
+      <a id="rawLink" class="btn ghost" href="#" target="_blank" rel="noreferrer" aria-disabled="true">打开原文件</a>
+    </div>
+  </header>
+
+  <main class="layout">
+    <aside class="sidebar">
+      <div class="sidebar-title">Files</div>
+      <div id="tree" class="tree"></div>
+    </aside>
+
+    <section class="viewer">
+      <div class="viewer-head">
+        <div id="filepath" class="filepath">请选择一个文件</div>
+        <div id="meta" class="meta"></div>
+      </div>
+
+      <div class="codewrap">
+        <pre class="pre"><code id="code" class="language-none"></code></pre>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span>Made for judges: clean, printable, shareable.</span>
+  </footer>
+
+  <script src="https://cdn.jsdelivr.net/npm/prismjs@1.29.0/prism.min.js"></script>
+  <script src="./main.js"></script>
+</body>
+</html>
