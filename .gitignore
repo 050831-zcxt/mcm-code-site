@@ -2,3 +2,5 @@ node_modules
 dist
 public/files
 public/manifest.json
+.idea/
+*.iml
