@@ -1,1 +1,1516 @@
+#Q1:
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
 
+M_TOTAL = 1e8 
+ELEV_ANNUAL_CAP = 179000  
+G0 = 9.81
+ISP_ROCKET = 380  
+
+DV_LEO_TO_MOON = 5800  
+DV_APEX_TO_MOON = 2600  
+
+C_LEO_START = 750  
+LEARNING_RATE = 0.90  
+OPEX_ELEV_BASE = 220  
+
+
+ROCKET_CAP_MAX = 10 * 365 * 150
+
+
+def mass_ratio(dv):
+
+    return np.exp(dv / (G0 * ISP_ROCKET))
+
+
+def get_rocket_unit_cost(cum_mass):
+
+    c_moon_init = C_LEO_START * mass_ratio(DV_LEO_TO_MOON)
+    b = -np.log2(LEARNING_RATE)
+    q_ref = 1e6  
+    return c_moon_init * (max(cum_mass, q_ref) / q_ref) ** (-b)
+
+
+def simulate(mode='hybrid', target_years=150):
+    history = []
+    cum_mass = 0
+
+
+    if mode == 'hybrid':
+        needed_rocket_mass = M_TOTAL - (ELEV_ANNUAL_CAP * target_years)
+        rocket_schedule = np.zeros(target_years)
+        rem = max(0, needed_rocket_mass)
+        for t in range(target_years - 1, -1, -1):
+            amount = min(ROCKET_CAP_MAX, rem)
+            rocket_schedule[t] = amount
+            rem -= amount
+
+    for t in range(1, 1000):
+        if cum_mass >= M_TOTAL: break
+
+        if mode == 'elevator':
+            m_e, m_r = min(ELEV_ANNUAL_CAP, M_TOTAL - cum_mass), 0
+        elif mode == 'rocket':
+            m_e, m_r = 0, min(ROCKET_CAP_MAX, M_TOTAL - cum_mass)
+        else:  # hybrid
+            if t > target_years: break
+            m_e = ELEV_ANNUAL_CAP
+            m_r = rocket_schedule[t - 1]
+
+
+        unit_c_r = get_rocket_unit_cost(cum_mass)
+        unit_c_e = OPEX_ELEV_BASE * mass_ratio(DV_APEX_TO_MOON)
+
+        annual_cost = (m_e * unit_c_e + m_r * unit_c_r) * 1000  # 吨转kg
+        cum_mass += (m_e + m_r)
+
+        history.append({
+            'Year': t, 'Mass_Added': m_e + m_r, 'Cum_Mass': cum_mass,
+            'Annual_Cost': annual_cost, 'Unit_Rocket_Cost': unit_c_r
+        })
+    return pd.DataFrame(history)
+
+#Q2:
+
+from __future__ import annotations
+
+import os
+import re
+import math
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple, List
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+# =========================
+# 0) Paths & Global Config
+# =========================
+EXCEL_PATH = "cs.xlsx"   # change if needed
+OUT_DIR = "outputs"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+RNG_SEED = 42
+N_SIM = 10000  # 10k is standard for stable CI; reduce if your laptop is slow
+MAX_YEARS = 5000  # safety cap (should never hit if plan is sensible)
+
+# Target mass to deliver to build the colony
+M0_TOTAL_MASS = 100_000_000.0  # metric tons (100 million)
+
+# Some plots look better with serif fonts in MCM papers
+plt.rcParams.update({
+    "font.family": "serif",
+    "font.size": 12,
+    "axes.titlesize": 14,
+    "axes.labelsize": 12,
+    "legend.fontsize": 11,
+})
+
+
+# =========================
+# 1) Parameters (2.1)
+# =========================
+@dataclass
+class ReliabilityParams:
+    # Space elevator
+    sway_a: float = 0.85            # eta_sway ~ U(a, 1)
+    lambda_e: float = 0.02          # annual failure intensity (Poisson rate)
+    repair_years: int = 2           # downtime length if failure occurs
+    repair_cost_fixed: float = 0.0  # optional fixed cost per elevator failure (USD)
+
+    # Rockets
+    beta: float = 0.02              # per-launch failure probability
+    rocket_payload: float = 120.0   # tons per launch (100-150 by problem statement)
+    delta_grounding: float = 0.25   # if >=1 accident in a year, reduce remaining capability fractionally
+    penalty_cost: float = 0.0       # fixed penalty cost if accident occurs in that year (USD)
+
+    # Accounting choices (important!)
+    pay_on_planned_mass: bool = True
+    # If True: you pay planned operating cost even if downtime happens (sunk staff/ops)
+    # If False: you only pay proportional to delivered mass
+
+
+# =========================
+# 2) Plan (x_t*, y_t*) & cost schedules
+# =========================
+@dataclass
+class AnnualPlan:
+    years: np.ndarray                   # year index (0,1,2,...)
+    elevator_mass: np.ndarray           # planned mass via elevator in that year (tons)
+    rocket_mass: np.ndarray             # planned mass via rockets in that year (tons)
+    elevator_cost_per_ton: np.ndarray   # Q(t) USD/ton
+    rocket_cost_per_ton: np.ndarray     # P(t) USD/ton
+
+
+def _canonicalize_col(s: str) -> str:
+    s = s.strip().lower()
+    s = re.sub(r"[\s\(\)\[\]\{\}]+", "_", s)
+    s = re.sub(r"__+", "_", s)
+    return s
+
+
+def _try_find_plan_sheet(xls: pd.ExcelFile) -> Optional[pd.DataFrame]:
+    """
+    Strategy:
+    - Read all sheets
+    - Prefer a sheet that contains year + (elevator_mass or rocket_mass) style columns
+    - If none found, return None (fallback later)
+    """
+    best = None
+    best_score = -1
+
+    for sh in xls.sheet_names:
+        try:
+            df = pd.read_excel(xls, sheet_name=sh)
+        except Exception:
+            continue
+
+        if df is None or df.empty:
+            continue
+
+        cols = [_canonicalize_col(c) for c in df.columns.astype(str)]
+        score = 0
+
+        # "year" or "t" indicator
+        if any(("year" in c) or (c in ["t", "time", "yr"]) for c in cols):
+            score += 2
+
+        # elevator / rocket mass indicators
+        if any(("elevator" in c or "harbour" in c or "space" in c) and ("mass" in c or "ton" in c) for c in cols):
+            score += 2
+        if any(("rocket" in c or "launch" in c) and ("mass" in c or "ton" in c) for c in cols):
+            score += 2
+
+        # cost indicators
+        if any(("q" in c or "elevator" in c) and ("cost" in c or "usd" in c) for c in cols):
+            score += 1
+        if any(("p" in c or "rocket" in c) and ("cost" in c or "usd" in c) for c in cols):
+            score += 1
+
+        if score > best_score:
+            best_score = score
+            best = df
+
+    # require some minimum evidence
+    if best_score >= 3:
+        return best
+    return None
+
+
+def _extract_plan_from_df(df: pd.DataFrame) -> Optional[AnnualPlan]:
+    """
+    Accept flexible column names:
+    - year: year / t / time
+    - elevator_mass: elevator_mass / space_elevator_mass / harbour_mass / x_t ...
+    - rocket_mass: rocket_mass / launches_mass / y_t ...
+    - elevator_cost_per_ton: Q / elevator_cost_per_ton / ...
+    - rocket_cost_per_ton: P / rocket_cost_per_ton / ...
+    """
+    if df is None or df.empty:
+        return None
+
+    # canonicalize
+    orig_cols = list(df.columns.astype(str))
+    col_map = {c: _canonicalize_col(c) for c in orig_cols}
+    df2 = df.rename(columns=col_map).copy()
+
+    cols = set(df2.columns)
+
+    def pick_col(candidates: List[str]) -> Optional[str]:
+        for c in candidates:
+            if c in cols:
+                return c
+        # fuzzy contains
+        for c in cols:
+            for cand in candidates:
+                if cand in c:
+                    return c
+        return None
+
+    c_year = pick_col(["year", "t", "time", "yr"])
+    c_emass = pick_col(["elevator_mass", "space_elevator_mass", "harbour_mass", "x_t", "x"])
+    c_rmass = pick_col(["rocket_mass", "launch_mass", "y_t", "y"])
+    c_q = pick_col(["elevator_cost_per_ton", "q", "q_t", "elevator_cost", "space_elevator_cost"])
+    c_p = pick_col(["rocket_cost_per_ton", "p", "p_t", "rocket_cost"])
+
+    if c_emass is None and c_rmass is None:
+        return None
+
+    # year index: if missing, use row index
+    if c_year is None:
+        years = np.arange(len(df2), dtype=float)
+    else:
+        years = pd.to_numeric(df2[c_year], errors="coerce").fillna(method="ffill").fillna(0).to_numpy()
+
+        # If year looks like calendar years (e.g., 2050, 2051...), convert to 0-based index
+        if np.nanmin(years) >= 1900:
+            years = years - np.nanmin(years)
+
+    def to_num(col: Optional[str], default: float) -> np.ndarray:
+        if col is None:
+            return np.full(len(df2), default, dtype=float)
+        return pd.to_numeric(df2[col], errors="coerce").fillna(default).to_numpy(dtype=float)
+
+    elevator_mass = to_num(c_emass, 0.0)
+    rocket_mass = to_num(c_rmass, 0.0)
+
+    # cost per ton: if absent, keep NaN for now (we'll fill later)
+    q = to_num(c_q, np.nan)
+    p = to_num(c_p, np.nan)
+
+    return AnnualPlan(
+        years=years.astype(int),
+        elevator_mass=elevator_mass,
+        rocket_mass=rocket_mass,
+        elevator_cost_per_ton=q,
+        rocket_cost_per_ton=p,
+    )
+
+
+def _fallback_plan_from_constants(
+    scenario: str,
+    q_per_ton: float,
+    p_per_ton: float,
+    elevator_cap: float = 179_000.0,
+    rocket_cap: float = 546_000.0,
+    hybrid_share_elevator: float = 0.3,
+    horizon_years: int = 600,
+) -> AnnualPlan:
+    """
+    Fallback if 参数.xlsx doesn't have a year-by-year plan.
+    Uses constant annual capacities, chosen to be consistent with typical deterministic results.
+
+    elevator_cap=179k/yr matches: 100M / 179k ≈ 559 years (as in many baseline solutions).
+    rocket_cap default uses 100M / 183 ≈ 546k/yr (commonly derived from sample comparisons).
+    """
+    years = np.arange(horizon_years, dtype=int)
+
+    if scenario.lower() == "elevator":
+        em = np.full(horizon_years, elevator_cap, dtype=float)
+        rm = np.zeros(horizon_years, dtype=float)
+    elif scenario.lower() == "rocket":
+        em = np.zeros(horizon_years, dtype=float)
+        rm = np.full(horizon_years, rocket_cap, dtype=float)
+    else:  # hybrid
+        em = np.full(horizon_years, elevator_cap * hybrid_share_elevator, dtype=float)
+        rm = np.full(horizon_years, rocket_cap * (1.0 - hybrid_share_elevator), dtype=float)
+
+    q = np.full(horizon_years, q_per_ton, dtype=float)
+    p = np.full(horizon_years, p_per_ton, dtype=float)
+
+    return AnnualPlan(years=years, elevator_mass=em, rocket_mass=rm,
+                      elevator_cost_per_ton=q, rocket_cost_per_ton=p)
+
+
+def load_plans_from_excel(excel_path: str) -> Dict[str, AnnualPlan]:
+    """
+    Returns dict with keys: "Elevator", "Rocket", "Hybrid"
+    Priority:
+    1) If excel contains a plan sheet with scenario column => split
+    2) Else if excel contains separate sheets => infer each
+    3) Else fallback constants (still runnable)
+    """
+    xls = pd.ExcelFile(excel_path)
+
+    # 1) Try to find a single plan sheet
+    df_plan = _try_find_plan_sheet(xls)
+    plan = _extract_plan_from_df(df_plan) if df_plan is not None else None
+
+    # Attempt scenario splitting if there's a "scenario" column
+    plans: Dict[str, AnnualPlan] = {}
+
+    if df_plan is not None:
+        cols_can = [_canonicalize_col(c) for c in df_plan.columns.astype(str)]
+        if any("scenario" in c or "strategy" in c or "method" in c for c in cols_can):
+            df0 = df_plan.rename(columns={c: _canonicalize_col(c) for c in df_plan.columns.astype(str)})
+            scen_col = None
+            for c in df0.columns:
+                if "scenario" in c or "strategy" in c or "method" in c:
+                    scen_col = c
+                    break
+            if scen_col is not None:
+                for key in ["elevator", "rocket", "hybrid"]:
+                    sub = df0[df0[scen_col].astype(str).str.lower().str.contains(key)].copy()
+                    sub = sub.drop(columns=[scen_col], errors="ignore")
+                    ap = _extract_plan_from_df(sub)
+                    if ap is not None:
+                        name = key.capitalize()
+                        plans[name] = ap
+
+    # 2) If not split, try reading per-sheet plans
+    if len(plans) == 0:
+        for sh in xls.sheet_names:
+            try:
+                df = pd.read_excel(xls, sheet_name=sh)
+            except Exception:
+                continue
+            ap = _extract_plan_from_df(df)
+            if ap is None:
+                continue
+            sh_l = sh.lower()
+            if "elev" in sh_l or "harbour" in sh_l or "tether" in sh_l:
+                plans["Elevator"] = ap
+            elif "rocket" in sh_l or "launch" in sh_l:
+                plans["Rocket"] = ap
+            elif "hybrid" in sh_l or "mix" in sh_l or "combined" in sh_l:
+                plans["Hybrid"] = ap
+
+    # 3) Fill missing costs if NaN:
+    # If you have deterministic totals in the excel (common), we can compute cost/ton.
+    # Otherwise use conservative defaults consistent with many baseline comparisons.
+    q_default = 4.419e5   # USD/ton (≈44.19T / 100M)
+    p_default = 2.080e6   # USD/ton (≈208T / 100M)
+    h_default = 1.6345e6  # USD/ton (≈163.45T / 100M) used only if needed
+
+    def fill_costs(ap: AnnualPlan, q_fill: float, p_fill: float) -> AnnualPlan:
+        q = ap.elevator_cost_per_ton.copy()
+        p = ap.rocket_cost_per_ton.copy()
+        q[np.isnan(q)] = q_fill
+        p[np.isnan(p)] = p_fill
+        return AnnualPlan(ap.years, ap.elevator_mass, ap.rocket_mass, q, p)
+
+    for k in list(plans.keys()):
+        if k == "Elevator":
+            plans[k] = fill_costs(plans[k], q_default, p_default)
+        elif k == "Rocket":
+            plans[k] = fill_costs(plans[k], q_default, p_default)
+        else:
+            plans[k] = fill_costs(plans[k], q_default, p_default)
+
+    # 4) Ensure all three exist; else fallback
+    if "Elevator" not in plans:
+        plans["Elevator"] = _fallback_plan_from_constants("elevator", q_default, p_default)
+    if "Rocket" not in plans:
+        plans["Rocket"] = _fallback_plan_from_constants("rocket", q_default, p_default)
+    if "Hybrid" not in plans:
+        plans["Hybrid"] = _fallback_plan_from_constants("hybrid", q_default, p_default, hybrid_share_elevator=0.30)
+
+    return plans
+
+
+# =========================
+# 3) Monte Carlo Simulation (2.2)
+# =========================
+def poisson_event_occurs(rng: np.random.Generator, lam: float) -> bool:
+    """Annual failure: Poisson(lam) >= 1"""
+    if lam <= 0:
+        return False
+    return rng.poisson(lam) >= 1
+
+
+def simulate_one_run(
+    plan: AnnualPlan,
+    params: ReliabilityParams,
+    rng: np.random.Generator,
+    m0: float = M0_TOTAL_MASS,
+    max_years: int = MAX_YEARS
+) -> Tuple[int, float]:
+    """
+    Returns:
+      T_years: completion time in years
+      C_total: total cost (USD)
+    """
+    t = 0
+    m_cum = 0.0
+    c_cum = 0.0
+
+    elevator_down_left = 0  # repair countdown
+
+    # If plan shorter than needed, we repeat the last row
+    n_plan = len(plan.years)
+    if n_plan == 0:
+        raise ValueError("Plan is empty.")
+
+    while m_cum < m0 and t < max_years:
+        idx = min(t, n_plan - 1)
+
+        x = float(plan.elevator_mass[idx])
+        y = float(plan.rocket_mass[idx])
+        q = float(plan.elevator_cost_per_ton[idx])
+        p = float(plan.rocket_cost_per_ton[idx])
+
+        # ---- Space Elevator subsystem ----
+        elevator_available = 1.0
+        if elevator_down_left > 0:
+            elevator_available = 0.0
+            elevator_down_left -= 1
+        else:
+            # Poisson annual failure
+            if poisson_event_occurs(rng, params.lambda_e):
+                elevator_available = 0.0
+                elevator_down_left = int(params.repair_years)
+                c_cum += float(params.repair_cost_fixed)
+
+        eta_sway = rng.uniform(params.sway_a, 1.0) if elevator_available > 0 else 0.0
+        delivered_e = x * eta_sway * elevator_available
+
+        if params.pay_on_planned_mass:
+            # pay ops even if downtime; delivered can be 0
+            cost_e = x * q
+        else:
+            cost_e = delivered_e * q
+
+        # ---- Rocket subsystem ----
+        payload = max(params.rocket_payload, 1e-9)
+        launches = int(math.ceil(y / payload)) if y > 0 else 0
+
+        if launches == 0:
+            delivered_r = 0.0
+            any_fail = False
+        else:
+            # successes ~ Binomial(launches, 1-beta)
+            successes = rng.binomial(launches, 1.0 - params.beta)
+            any_fail = successes < launches
+
+            delivered_r = successes * payload
+            delivered_r = min(delivered_r, y)  # cannot exceed planned
+
+            # grounding penalty: if any accident, lose delta fraction of annual capability
+            if any_fail:
+                delivered_r *= (1.0 - params.delta_grounding)
+                c_cum += float(params.penalty_cost)
+
+        if params.pay_on_planned_mass:
+            cost_r = y * p
+        else:
+            cost_r = delivered_r * p
+
+        # ---- Update totals ----
+        m_cum += delivered_e + delivered_r
+        c_cum += cost_e + cost_r
+
+        t += 1
+
+    return t, c_cum
+
+
+def run_monte_carlo(
+    plan: AnnualPlan,
+    params: ReliabilityParams,
+    n_sim: int = N_SIM,
+    seed: int = RNG_SEED
+) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    T = np.zeros(n_sim, dtype=int)
+    C = np.zeros(n_sim, dtype=float)
+
+    for i in range(n_sim):
+        Ti, Ci = simulate_one_run(plan, params, rng)
+        T[i] = Ti
+        C[i] = Ci
+
+    return pd.DataFrame({"T_years": T, "C_total_USD": C})
+
+
+# =========================
+# 4) Summary Stats
+# =========================
+def summarize_samples(df: pd.DataFrame, deadline_years: Optional[float] = None) -> Dict[str, float]:
+    T = df["T_years"].to_numpy(dtype=float)
+    C = df["C_total_USD"].to_numpy(dtype=float)
+
+    def ci95(x: np.ndarray) -> Tuple[float, float]:
+        lo, hi = np.percentile(x, [2.5, 97.5])
+        return float(lo), float(hi)
+
+    out = {}
+    out["T_mean"] = float(np.mean(T))
+    out["T_std"] = float(np.std(T, ddof=1))
+    out["T_ci95_lo"], out["T_ci95_hi"] = ci95(T)
+    out["T_p90"] = float(np.percentile(T, 90))
+    out["T_p95"] = float(np.percentile(T, 95))
+
+    out["C_mean_USD"] = float(np.mean(C))
+    out["C_std_USD"] = float(np.std(C, ddof=1))
+    out["C_ci95_lo_USD"], out["C_ci95_hi_USD"] = ci95(C)
+    out["C_p90_USD"] = float(np.percentile(C, 90))
+    out["C_p95_USD"] = float(np.percentile(C, 95))
+
+    if deadline_years is not None:
+        out["P(T > deadline)"] = float(np.mean(T > deadline_years))
+
+    return out
+
+
+# =========================
+# 5) Publication-ready plots (pastel)
+# =========================
+PASTEL = {
+    "Elevator": "#9ecae1",  # light blue
+    "Rocket":   "#fdae6b",  # light orange
+    "Hybrid":   "#a1d99b",  # light green
+}
+
+def _style_axes(ax):
+    ax.grid(True, which="major", linestyle="--", linewidth=0.6, alpha=0.35)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+def plot_histograms(all_samples: Dict[str, pd.DataFrame]):
+    # Completion time histogram
+    fig, ax = plt.subplots(figsize=(8.6, 5.2))
+    for name, df in all_samples.items():
+        ax.hist(df["T_years"], bins=40, density=True, alpha=0.35, label=name, color=PASTEL.get(name, None))
+    ax.set_xlabel("Completion Time (years)")
+    ax.set_ylabel("Density")
+    _style_axes(ax)
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUT_DIR, "fig_T_hist.png"), dpi=300)
+    plt.close(fig)
+
+    # Cost histogram (convert to trillion for readability)
+    fig, ax = plt.subplots(figsize=(8.6, 5.2))
+    for name, df in all_samples.items():
+        ax.hist(df["C_total_USD"] / 1e12, bins=40, density=True, alpha=0.35, label=name, color=PASTEL.get(name, None))
+    ax.set_xlabel("Total Cost (trillion USD)")
+    ax.set_ylabel("Density")
+    _style_axes(ax)
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUT_DIR, "fig_C_hist.png"), dpi=300)
+    plt.close(fig)
+
+def plot_ecdf(all_samples: Dict[str, pd.DataFrame]):
+    fig, ax = plt.subplots(figsize=(8.6, 5.2))
+    for name, df in all_samples.items():
+        x = np.sort(df["T_years"].to_numpy())
+        y = np.arange(1, len(x) + 1) / len(x)
+        ax.plot(x, y, linewidth=2.0, label=name, color=PASTEL.get(name, None))
+    ax.set_xlabel("Completion Time (years)")
+    ax.set_ylabel("ECDF")
+    _style_axes(ax)
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUT_DIR, "fig_T_ecdf.png"), dpi=300)
+    plt.close(fig)
+
+def plot_cost_time_scatter(all_samples: Dict[str, pd.DataFrame]):
+    fig, ax = plt.subplots(figsize=(8.6, 5.2))
+    for name, df in all_samples.items():
+        ax.scatter(df["T_years"], df["C_total_USD"] / 1e12,
+                   s=10, alpha=0.18, label=name, color=PASTEL.get(name, None), edgecolors="none")
+    ax.set_xlabel("Completion Time (years)")
+    ax.set_ylabel("Total Cost (trillion USD)")
+    _style_axes(ax)
+    ax.legend(frameon=False)
+    fig.tight_layout()
+    fig.savefig(os.path.join(OUT_DIR, "fig_cost_time_scatter.png"), dpi=300)
+    plt.close(fig)
+
+
+# =========================
+# 6) Main
+# =========================
+def main():
+    print("Loading plans from Excel:", EXCEL_PATH)
+    plans = load_plans_from_excel(EXCEL_PATH)
+
+    # --- Reliability parameter set (edit to match your paper choices) ---
+    # These default values follow your docx structure:
+    # eta_sway ~ U(a, 1), elevator failures via Poisson(lambda_E), repair lasts k years
+    # rocket failures per launch ~ Bernoulli(beta), with grounding penalty delta
+    params = ReliabilityParams(
+        sway_a=0.85,
+        lambda_e=0.02,
+        repair_years=2,
+        repair_cost_fixed=0.0,
+        beta=0.02,
+        rocket_payload=120.0,
+        delta_grounding=0.25,
+        penalty_cost=0.0,
+        pay_on_planned_mass=True,
+    )
+
+    all_samples: Dict[str, pd.DataFrame] = {}
+    summary_rows = []
+
+    for name in ["Elevator", "Rocket", "Hybrid"]:
+        print(f"Running Monte Carlo for: {name}")
+        df = run_monte_carlo(plans[name], params, n_sim=N_SIM, seed=RNG_SEED + hash(name) % 10000)
+        df["Scenario"] = name
+        all_samples[name] = df
+
+        stats = summarize_samples(df, deadline_years=None)
+        stats["Scenario"] = name
+        summary_rows.append(stats)
+
+    # Save samples
+    samples_all = pd.concat(all_samples.values(), ignore_index=True)
+    samples_path = os.path.join(OUT_DIR, "problem2_mc_samples.csv")
+    samples_all.to_csv(samples_path, index=False)
+    print("Saved samples to:", samples_path)
+
+    # Save summary
+    summary_df = pd.DataFrame(summary_rows)
+    summary_path = os.path.join(OUT_DIR, "problem2_mc_summary.csv")
+    summary_df.to_csv(summary_path, index=False)
+    print("Saved summary to:", summary_path)
+
+    # Print key results
+    with pd.option_context("display.max_columns", 200):
+        print("\n=== Monte Carlo Summary (key columns) ===")
+        show_cols = [
+            "Scenario",
+            "T_mean", "T_ci95_lo", "T_ci95_hi", "T_p95",
+            "C_mean_USD", "C_ci95_lo_USD", "C_ci95_hi_USD", "C_p95_USD"
+        ]
+        cols_exist = [c for c in show_cols if c in summary_df.columns]
+        print(summary_df[cols_exist])
+
+    # Plots
+    print("Generating figures...")
+    plot_histograms(all_samples)
+    plot_ecdf(all_samples)
+    plot_cost_time_scatter(all_samples)
+    print("Figures saved to:", OUT_DIR)
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+#Q3:
+import matplotlib.pyplot as plt
+from matplotlib.path import Path
+import matplotlib.patches as patches
+
+# =========================
+# 0) Global style (paper-like)
+# =========================
+plt.rcParams.update({
+    "font.family": "serif",
+    "font.serif": ["Times New Roman", "DejaVu Serif"],
+    "figure.dpi": 300,
+})
+
+# =========================
+# 1) Data (your confirmed numbers)
+# =========================
+mass_total_t = 41238  # tons
+mass_se = 0.75
+mass_rk = 0.25
+
+cost_total_m = 362  # million USD
+cost_se_m = 156
+cost_rk_m = 206
+cost_se = cost_se_m / cost_total_m
+cost_rk = cost_rk_m / cost_total_m
+
+# Colors (soft, paper-friendly)
+COLOR_SE = "#A8D8EA"   # soft blue
+COLOR_RK = "#FAD7A0"   # soft orange
+TXT = "#2b2b2b"
+TITLE = "#444444"
+
+# =========================
+# 2) Helpers
+# =========================
+def fmt_tons(x):
+    return f"{x:,.0f} tons"
+
+def fmt_money_m(x):
+    return f"${x:.1f} M"
+
+def draw_flow(ax, x0, x1, y0_top, y0_bot, y1_top, y1_bot, color, alpha=0.85, curve=0.45):
+    """
+    Draw a smooth Sankey-like ribbon connecting two vertical bars.
+    curve: controls how "bulgy" the ribbon is (0.35~0.55 works well)
+    """
+    dx = x1 - x0
+    c1 = x0 + dx * curve
+    c2 = x1 - dx * curve
+
+    verts = [
+        (x0, y0_top),          # start top
+        (c1, y0_top),          # bezier ctrl1
+        (c2, y1_top),          # bezier ctrl2
+        (x1, y1_top),          # end top
+        (x1, y1_bot),          # end bottom
+        (c2, y1_bot),          # bezier ctrl3
+        (c1, y0_bot),          # bezier ctrl4
+        (x0, y0_bot),          # start bottom
+        (x0, y0_top),          # close
+    ]
+    codes = [
+        Path.MOVETO,
+        Path.CURVE4, Path.CURVE4, Path.CURVE4,
+        Path.LINETO,
+        Path.CURVE4, Path.CURVE4, Path.CURVE4,
+        Path.CLOSEPOLY
+    ]
+    path = Path(verts, codes)
+    patch = patches.PathPatch(path, facecolor=color, edgecolor="none", alpha=alpha, zorder=1)
+    ax.add_patch(patch)
+
+def add_block_label(ax, x, y_mid, pct, value_str, fontsize=12):
+    ax.text(
+        x, y_mid,
+        f"{pct:.0f}%\n({value_str})",
+        ha="center", va="center",
+        color=TXT, fontsize=fontsize, zorder=5
+    )
+
+# =========================
+# 3) Layout
+# =========================
+fig, ax = plt.subplots(figsize=(12, 6))
+
+x_left = 0.12
+x_right = 0.88
+bar_w = 0.10
+
+# y positions: bottom segment then top segment
+# Left (mass)
+yL_rk_bot = 0.0
+yL_rk_top = mass_rk
+yL_se_bot = mass_rk
+yL_se_top = 1.0
+
+# Right (cost)
+yR_rk_bot = 0.0
+yR_rk_top = cost_rk
+yR_se_bot = cost_rk
+yR_se_top = 1.0
+
+# =========================
+# 4) Bars
+# =========================
+# Left bars (Mass)
+ax.bar(x_left, mass_rk, width=bar_w, bottom=0, color=COLOR_RK, edgecolor="white", linewidth=1.0, zorder=3)
+ax.bar(x_left, mass_se, width=bar_w, bottom=mass_rk, color=COLOR_SE, edgecolor="white", linewidth=1.0, zorder=3)
+
+# Right bars (Cost)
+ax.bar(x_right, cost_rk, width=bar_w, bottom=0, color=COLOR_RK, edgecolor="white", linewidth=1.0, zorder=3)
+ax.bar(x_right, cost_se, width=bar_w, bottom=cost_rk, color=COLOR_SE, edgecolor="white", linewidth=1.0, zorder=3)
+
+# =========================
+# 5) Ribbons (flows)
+# =========================
+# Space Elevator ribbon: from left-top block to right-top block
+draw_flow(ax,
+          x_left + bar_w/2, x_right - bar_w/2,
+          yL_se_top, yL_se_bot,
+          yR_se_top, yR_se_bot,
+          COLOR_SE, alpha=0.80, curve=0.48)
+
+# Rocket ribbon: from left-bottom block to right-bottom block
+draw_flow(ax,
+          x_left + bar_w/2, x_right - bar_w/2,
+          yL_rk_top, yL_rk_bot,
+          yR_rk_top, yR_rk_bot,
+          COLOR_RK, alpha=0.80, curve=0.48)
+
+# =========================
+# 6) Titles & labels
+# =========================
+ax.text(x_left, 1.04, "MASS DISTRIBUTION", ha="center", va="bottom",
+        fontsize=14, fontweight="bold", color=TITLE)
+ax.text(x_right, 1.04, "COST DISTRIBUTION", ha="center", va="bottom",
+        fontsize=14, fontweight="bold", color=TITLE)
+
+# Block annotations (left)
+add_block_label(ax, x_left, (yL_se_bot + yL_se_top)/2, mass_se*100, fmt_tons(mass_total_t*mass_se), fontsize=12)
+add_block_label(ax, x_left, (yL_rk_bot + yL_rk_top)/2, mass_rk*100, fmt_tons(mass_total_t*mass_rk), fontsize=12)
+
+# Block annotations (right)
+add_block_label(ax, x_right, (yR_se_bot + yR_se_top)/2, cost_se*100, fmt_money_m(cost_se_m), fontsize=12)
+add_block_label(ax, x_right, (yR_rk_bot + yR_rk_top)/2, cost_rk*100, fmt_money_m(cost_rk_m), fontsize=12)
+
+# Subtitles in the middle (optional, subtle)
+ax.text(0.50, 0.96, "Space Elevator (High Volume, Lower Unit Cost)",
+        ha="center", va="center", fontsize=10, color="#2c7fb8", alpha=0.85, fontweight="bold")
+ax.text(0.50, 0.06, "Rocket Fleet (Low Volume, Higher Unit Cost)",
+        ha="center", va="center", fontsize=10, color="#d07a1c", alpha=0.85, fontweight="bold")
+
+# Legend (outside, not covering the plot)
+legend_handles = [
+    patches.Patch(facecolor=COLOR_SE, edgecolor="none", label="Space Elevator"),
+    patches.Patch(facecolor=COLOR_RK, edgecolor="none", label="Rocket Fleet"),
+]
+ax.legend(handles=legend_handles, loc="upper left", bbox_to_anchor=(1.01, 0.98),
+          frameon=True, fontsize=11, borderpad=0.6)
+
+# =========================
+# 7) Clean canvas
+# =========================
+ax.set_xlim(0, 1.05)   # extra room for legend
+ax.set_ylim(0, 1.10)
+ax.axis("off")
+
+plt.tight_layout()
+plt.savefig("Problem3_Sankey_Optimized.png", bbox_inches="tight")
+plt.show()
+
+
+
+#Q4:
+import pandas as pd
+import numpy as np
+import math
+import re
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+from matplotlib.colors import Normalize
+
+# =============================
+# 0) Load parameters.xlsx
+# =============================
+xlsx_path = "cs.xlsx" 
+params = pd.read_excel(xlsx_path, sheet_name="Parameters")
+
+def parse_value(v):
+    """Parse numeric values that may appear as ranges like '100–150' or strings."""
+    if pd.isna(v):
+        return np.nan
+    if isinstance(v, (int, float, np.integer, np.floating)):
+        return float(v)
+    s = str(v).strip().replace(",", "")
+    s = s.replace("–", "-").replace("—", "-").replace("~", "").replace(">", "").replace("<", "")
+    m = re.match(r"^\s*([0-9.]+)\s*-\s*([0-9.]+)\s*$", s)
+    if m:
+        a, b = float(m.group(1)), float(m.group(2))
+        return 0.5 * (a + b)  # midpoint
+    try:
+        return float(s)
+    except:
+        return np.nan
+
+def get_param(symbol, default=np.nan):
+    row = params.loc[params["Symbol"] == symbol]
+    if len(row) == 0:
+        return default
+    return parse_value(row.iloc[0]["Value"])
+
+# =============================
+# 1) Core inputs from your Excel
+# =============================
+# Problem statement
+M_const_t = get_param("M_const")                     # metric tons
+C_elev_tpy = get_param("C_elev")                     # metric tons/year (system)
+m_payload_rocket_t = get_param("m_payload_rocket", 150.0)  # metric tons/launch
+m_prop_FH_total_kg = get_param("m_prop_FH_total")          # kg propellant / launch (Falcon Heavy proxy)
+
+# Cost model
+OpEx_elev_unit_usd_per_lb = get_param("OpEx_elev_unit", 100.0)  # USD/lb
+CapEx_elev_total_busd = get_param("CapEx_elev_total", 10.0)     # Billion USD
+c_GEO_elec_usd_per_kg = get_param("c_GEO_elec", 1.48)           # $/kg @ $0.10/kWh (implies kWh/kg)
+
+c_LEO_reuse_20 = get_param("c_LEO_reuse_20", 1663.0)            # USD/kg (early)
+c_LEO_reuse_200 = get_param("c_LEO_reuse_200", 756.0)           # USD/kg (mature)
+f_lc = get_param("f_lc", 0.9)                                   # learning curve factor
+
+# LEO->Moon penalty proxy from SLS ratio (conservative proxy)
+m_LEO_SLS = get_param("m_LEO_SLS_B1", 95.0)
+m_TLI_SLS = get_param("m_TLI_SLS_B1", 27.0)
+penalty_LEO_to_Moon = (m_LEO_SLS / m_TLI_SLS) if (m_TLI_SLS and not np.isnan(m_TLI_SLS)) else 3.5
+
+# Emission indices (per kg propellant)
+EI_CO2_ker = get_param("EI_CO2_ker", 637.0) / 1000.0  # kg CO2 / kg prop
+EI_BC_ker  = get_param("EI_BC_ker", 22.0)  / 1000.0   # kg BC  / kg prop
+N_port = 1  # baseline: 1 harbor operational (to be consistent with Q1 table)
+
+# =============================
+# 2) Assumptions (explicit & editable)
+#    — these are the only "modeling assumptions" not directly in Excel.
+# =============================
+price_per_kwh = 0.10  # consistent with how c_GEO_elec is defined
+kwh_per_kg_elev = c_GEO_elec_usd_per_kg / price_per_kwh  # implied kWh/kg
+
+grid_I0 = 0.40      # kg CO2/kWh (baseline grid intensity at 2050)
+decarb_k = 0.03     # 1/year (exponential decarbonization rate), 2050->2150 cleaner
+year0 = 2050
+
+# Stratospheric sensitivity weighting (per your Problem 4 notes)
+f_high_alt = 0.20   # fraction of propellant "high-alt" (simplified)
+s_strat = 3.0       # high-alt sensitivity multiplier
+GWP_BC = 900.0      # BC -> CO2e factor (order-of-magnitude representative)
+
+# Rocket cadence limit (aggregated over multiple sites)
+L_max_per_year = 5000
+
+# =============================
+# 3) Units & conversions
+# =============================
+KG_PER_TONNE = 1000.0
+LB_PER_KG = 2.2046226218
+
+M_total_kg = M_const_t * KG_PER_TONNE
+C_elev_per_port_kgpy = C_elev_tpy * 1000
+C_elev_kgpy = N_port * C_elev_per_port_kgpy *3
+payload_kg = m_payload_rocket_t * KG_PER_TONNE
+
+OpEx_elev_usd_per_kg = OpEx_elev_unit_usd_per_lb * LB_PER_KG
+CapEx_elev_usd = CapEx_elev_total_busd * 1e9
+
+# Wright's law exponent: if cumulative doubles, cost multiplies by f_lc
+b_wright = math.log(f_lc) / math.log(2)  # negative if learning occurs
+
+# =============================
+# 4) Environment & cost evaluators
+# =============================
+def label_bars(ax, bars, fmt="{:.2f}", pad=3, fontsize=10):
+    """
+    ax: matplotlib axis
+    bars: ax.bar(...) 返回的 BarContainer
+    fmt: 数值格式，如 "{:.0f}" "{:.2f}"
+    pad: 标签离柱顶的像素距离
+    """
+    for b in bars:
+        h = b.get_height()
+        if np.isnan(h):
+            continue
+        ax.annotate(
+            fmt.format(h),
+            (b.get_x() + b.get_width() / 2, h),
+            xytext=(0, pad),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=fontsize
+        )
+
+def avg_grid_intensity_over_T(T):
+    """
+    Average of I0*exp(-k*t) over t in [0, T).
+    """
+    if T <= 0:
+        return grid_I0
+    return grid_I0 * (1 - math.exp(-decarb_k * T)) / (decarb_k * T)
+
+def elevator_cost_usd(mass_kg):
+    return CapEx_elev_usd + OpEx_elev_usd_per_kg * mass_kg
+
+def elevator_env_co2e_kg(mass_kg, T):
+    kwh = mass_kg * kwh_per_kg_elev
+    return kwh * avg_grid_intensity_over_T(T)
+
+def rocket_env_co2e_kg(num_launches):
+    """
+    CO2e = CO2 + weighted BC (higher for high-alt fraction).
+    """
+    if num_launches <= 0:
+        return 0.0
+    prop = m_prop_FH_total_kg * num_launches
+    co2 = prop * EI_CO2_ker
+    bc  = prop * EI_BC_ker
+    bc_co2e = ((1 - f_high_alt) * bc * GWP_BC + f_high_alt * bc * GWP_BC * s_strat)
+    return co2 + bc_co2e
+
+def rocket_cost_usd(num_launches):
+    """
+    Aggregate rocket cost without summing per-launch (N can be huge).
+    per-kg to LEO: c(n)=max(c_mature, c0*n^b), then * penalty to Moon.
+    total = payload_kg * sum_{n=1..N} c_moon(n), approximated by integral + plateau.
+    """
+    N = int(num_launches)
+    if N <= 0:
+        return 0.0
+
+    c0 = c_LEO_reuse_20
+    c_min = c_LEO_reuse_200
+
+    # N* where c0*(N*)^b = c_min
+    if abs(b_wright) < 1e-12:
+        N_star = 1.0
+    else:
+        N_star = (c_min / c0) ** (1.0 / b_wright)
+    N_star = max(1.0, float(N_star))
+
+    def integral_pow(n1, n2, b):
+        # ∫ n^b dn
+        if abs(b + 1) < 1e-12:
+            return math.log(n2 / n1)
+        return (n2 ** (b + 1) - n1 ** (b + 1)) / (b + 1)
+
+    if N <= N_star:
+        sum_c_leo = c0 * integral_pow(1.0, N + 1.0, b_wright)
+    else:
+        sum_c_leo = c0 * integral_pow(1.0, N_star, b_wright) + c_min * (N - N_star + 1)
+
+    sum_c_moon = sum_c_leo * penalty_LEO_to_Moon
+    return payload_kg * sum_c_moon
+
+def evaluate_plan(T, rocket_fraction):
+    """
+    Decision variables:
+      T (years), rocket_fraction r in [0,1]
+    Constraints:
+      elevator mass <= C_elev*T
+      rocket launches <= L_max_per_year*T
+    Objectives: minimize cost, time, env.
+    """
+    T = int(T)
+    if T <= 0:
+        return None
+
+    m_rocket = rocket_fraction * M_total_kg
+    m_elev = M_total_kg - m_rocket
+
+    # elevator capacity constraint
+    if m_elev > C_elev_kgpy * T + 1e-9:
+        return None
+
+    launches = int(math.ceil(m_rocket / payload_kg)) if m_rocket > 0 else 0
+    if launches > L_max_per_year * T:
+        return None
+
+    cost = rocket_cost_usd(launches) + elevator_cost_usd(m_elev)
+    env = rocket_env_co2e_kg(launches) + elevator_env_co2e_kg(m_elev, T)
+
+    return dict(T=T, r=rocket_fraction, launches=launches,
+                m_rocket=m_rocket, m_elev=m_elev,
+                cost=cost, env=env)
+
+# =============================
+# 5) Pareto set (3-objective nondominated)
+# =============================
+rng = np.random.default_rng(1)
+cands = []
+for _ in range(30000):
+    T = int(rng.integers(20, 350))
+    r = float(rng.random())
+    out = evaluate_plan(T, r)
+    if out is not None:
+        cands.append(out)
+
+arr = np.array([[c["cost"], c["T"], c["env"]] for c in cands], dtype=float)
+
+def is_dominated(i):
+    v = arr[i]
+    dom = np.all(arr <= v, axis=1) & np.any(arr < v, axis=1)
+    return dom.any()
+
+keep = np.array([not is_dominated(i) for i in range(len(cands))], dtype=bool)
+pareto = [cands[i] for i in range(len(cands)) if keep[i]]
+pareto_arr = np.array([[p["cost"], p["T"], p["env"]] for p in pareto], dtype=float)
+
+# knee: closest to ideal after normalization
+mins, maxs = pareto_arr.min(axis=0), pareto_arr.max(axis=0)
+norm = (pareto_arr - mins) / (maxs - mins + 1e-12)
+dist = np.linalg.norm(norm, axis=1)
+knee = pareto[int(dist.argmin())]
+pareto_df = pd.DataFrame({
+    "time_years": [p["T"] for p in pareto],
+    "cost_trillion": [p["cost"]/1e12 for p in pareto],
+    "env_mt": [p["env"]/1e9 for p in pareto],
+    "rocket_share": [p["r"] for p in pareto],
+})
+pareto_df["is_knee"] = 0
+pareto_df.loc[int(dist.argmin()), "is_knee"] = 1
+pareto_df.to_csv("pareto_points.csv", index=False)
+print("Saved pareto_points.csv")
+
+# =============================
+# 6) Baseline scenarios
+# =============================
+# A) Elevator only
+T_elev_only = int(math.ceil(M_total_kg / C_elev_kgpy))
+A = evaluate_plan(T_elev_only, 0.0)
+
+# B) Rockets only (time-min by max cadence)
+launches_total = int(math.ceil(M_total_kg / payload_kg))
+T_rocket_only = int(math.ceil(launches_total / L_max_per_year))
+B = evaluate_plan(T_rocket_only, 1.0)
+
+# C) Hybrid knee
+C = knee
+
+# =============================
+# 7) Print results table
+# =============================
+def usd_to_trillion(x): return x / 1e12
+def kg_to_Mt(x): return x / 1e9
+
+results = pd.DataFrame([
+    ["Elevator only", A["T"], A["launches"], kg_to_Mt(A["m_elev"]), kg_to_Mt(A["m_rocket"]), usd_to_trillion(A["cost"]), kg_to_Mt(A["env"])],
+    ["Rockets only",  B["T"], B["launches"], kg_to_Mt(B["m_elev"]), kg_to_Mt(B["m_rocket"]), usd_to_trillion(B["cost"]), kg_to_Mt(B["env"])],
+    ["Hybrid (Pareto knee)", C["T"], C["launches"], kg_to_Mt(C["m_elev"]), kg_to_Mt(C["m_rocket"]), usd_to_trillion(C["cost"]), kg_to_Mt(C["env"])],
+], columns=["Scenario", "Time (years)", "Total launches",
+            "Elevator mass (Mt)", "Rocket mass (Mt)",
+            "Total cost (trillion USD)", "Env impact (Mt CO2e)"])
+
+print("\n=== Problem 4 Results (3 scenarios) ===")
+print(results.to_string(index=False))
+
+print("\n=== Recommended Hybrid (Pareto knee) ===")
+print(f"T = {C['T']} years")
+print(f"Rocket share = {C['r']:.3f}, Elevator share = {1-C['r']:.3f}")
+print(f"Total rocket launches = {C['launches']}")
+print(f"Total cost = {usd_to_trillion(C['cost']):.3f} trillion USD")
+print(f"Environmental impact = {kg_to_Mt(C['env']):.3f} Mt CO2e")
+
+
+
+#Sensitivity Analysis.py:
+import pandas as pd
+import numpy as np
+import re
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+from matplotlib.colors import ListedColormap
+
+plt.rcParams.update({
+    "font.size": 18,
+    "axes.titlesize": 20,
+    "axes.labelsize": 18,
+    "xtick.labelsize": 16,
+    "ytick.labelsize": 16,
+    "legend.fontsize": 16,
+    "font.family": "DejaVu Serif",
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "axes.grid": False,
+})
+
+# =============================
+# 0) File path
+# =============================
+PARAM_XLSX = "cs.xlsx"
+
+# =============================
+# 1) Load & parse parameters
+# =============================
+params_df = pd.read_excel(PARAM_XLSX, sheet_name="Parameters")
+
+range_pat = re.compile(r"(?P<a>\d*\.?\d+(?:[eE][-+]?\d+)?)\s*-\s*(?P<b>\d*\.?\d+(?:[eE][-+]?\d+)?)")
+num_pat   = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
+
+def strip_paren(s: str) -> str:
+    """Remove the first '(' and everything after it."""
+    if s is None:
+        return s
+    i = s.find("(")
+    return s[:i].rstrip() if i != -1 else s
+
+def parse_numeric_or_range(val):
+    """Parse scalar number or range like '100–150' / '100-150'."""
+    if pd.isna(val):
+        return None
+    if isinstance(val, (int, float, np.integer, np.floating)):
+        return float(val)
+    s = str(val).strip().replace("–", "-").replace("—", "-").replace("−", "-")
+    m = range_pat.search(s)
+    if m:
+        a = float(m.group("a")); b = float(m.group("b"))
+        return (min(a, b), max(a, b))
+    m2 = num_pat.search(s)
+    if m2:
+        return float(m2.group(0))
+    return None
+
+def mid(v):
+    return (v[0] + v[1]) / 2 if isinstance(v, tuple) else v
+
+# raw values/ranges + metadata
+p_raw = {}
+meta  = {}
+for _, row in params_df.iterrows():
+    sym = row.get("Symbol")
+    val = parse_numeric_or_range(row.get("Value"))
+    if sym is None or pd.isna(sym) or val is None:
+        continue
+    sym = str(sym).strip()
+    p_raw[sym] = val
+    meta[sym] = {
+        "Parameter": row.get("Parameter"),
+        "Unit": row.get("Unit"),
+        "Category": row.get("Category"),
+    }
+
+# baseline (midpoint for ranges)
+p_base = {k: mid(v) for k, v in p_raw.items()}
+# if rocket payload is a range, use the high-end (e.g., 150 t/launch)
+if isinstance(p_raw.get("m_payload_rocket"), tuple):
+    p_base["m_payload_rocket"] = p_raw["m_payload_rocket"][1]
+
+def nice_label(sym, max_len=46):
+    """Axis label from Excel: Parameter (Unit)."""
+    name = meta.get(sym, {}).get("Parameter", None)
+    unit = meta.get(sym, {}).get("Unit", None)
+
+    if name is None or (isinstance(name, float) and np.isnan(name)):
+        s = sym
+    else:
+        s = str(name).strip()
+        if unit and not (isinstance(unit, float) and np.isnan(unit)):
+            u = str(unit).strip()
+            if u:
+                s = f"{s} ({u})"
+    if len(s) > max_len:
+        s = s[:max_len-1] + "…"
+    return s
+
+# Scenario knobs (fixed during bivariate plots)
+scenario_base = {"N_sites": 10.0, "launches_per_site_per_day": 1.0, "CI_grid": 0.40}
+
+# =============================
+# 2) Model evaluation
+# =============================
+def eval_outputs(p, N_sites=10, launches_per_site_per_day=1.0, CI_grid=0.40, rocket_fuel="ch4"):
+    # total mission mass
+    M_const_t = float(p["M_const"])     # tonnes
+    M_kg      = M_const_t * 1000.0
+
+    # capacities
+    C_elev_tyr = float(p["C_elev"])              # t/yr
+    payload_t  = float(p["m_payload_rocket"])    # t/launch
+
+    L_year     = float(N_sites) * float(launches_per_site_per_day) * 365.0
+    C_rock_tyr = payload_t * L_year
+
+    # times
+    T_e = M_const_t / C_elev_tyr
+    T_r = M_const_t / C_rock_tyr
+    T_h = M_const_t / (C_elev_tyr + C_rock_tyr)
+
+    # hybrid mass split
+    M_elev_h_kg = C_elev_tyr * T_h * 1000.0
+    M_rock_h_kg = M_kg - M_elev_h_kg
+
+    # ---- Cost model ----
+    op_usd_lb = float(p.get("OpEx_elev_unit", 100.0))
+    op_usd_kg = op_usd_lb * 2.2046226218
+
+    capex_bil = float(p.get("CapEx_elev_total", 0.0))  # Billion USD
+    capex_usd = capex_bil * 1e9
+
+    cost_elev_only = capex_usd + op_usd_kg * M_kg
+    cost_hybrid_e  = capex_usd + op_usd_kg * M_elev_h_kg
+
+    # rocket cost to LEO: interpolate between 20/yr and 200/yr benchmarks
+    c20  = float(p.get("c_LEO_reuse_20", 1663.0))
+    c200 = float(p.get("c_LEO_reuse_200", 756.0))
+    if L_year <= 20:
+        c_leo = c20
+    elif L_year >= 200:
+        c_leo = c200
+    else:
+        x  = np.log(L_year); x0 = np.log(20.0); x1 = np.log(200.0)
+        y0 = np.log(c20);   y1 = np.log(c200)
+        c_leo = float(np.exp(y0 + (y1 - y0) * (x - x0) / (x1 - x0)))
+
+    # LEO -> TLI penalty factor (proxy)
+    f_TLI = float(p.get("m_LEO_SLS_B1", 95.0)) / float(p.get("m_TLI_SLS_B1", 27.0))
+    c_tli = c_leo * f_TLI
+
+    cost_rock_only = c_tli * M_kg
+    cost_hybrid_r  = c_tli * M_rock_h_kg
+    cost_hybrid    = cost_hybrid_e + cost_hybrid_r
+
+    # ---- Emissions model ----
+    e_GEO = float(p.get("e_GEO", 14.8))   # kWh/kg
+    co2_elev_only = M_kg * e_GEO * CI_grid
+    co2_hybrid_e  = M_elev_h_kg * e_GEO * CI_grid
+
+    mlox = float(p.get("m_LOX_SLS_core", 843.7)) * 1000.0
+    mlh2 = float(p.get("m_LH2_SLS_core", 143.8)) * 1000.0
+    payload_sls = float(p.get("m_TLI_SLS_B1", 27.0)) * 1000.0
+    r_prop = (mlox + mlh2) / payload_sls
+
+    EI = float(p.get("EI_CO2_ch4", 426.0)) if rocket_fuel == "ch4" else float(p.get("EI_CO2_ker", 637.0))
+    co2_per_payload = (EI / 1000.0) * r_prop  # kgCO2/kg payload
+
+    co2_rock_only = M_kg * co2_per_payload
+    co2_hybrid_r  = M_rock_h_kg * co2_per_payload
+
+    return {
+        "T_elevator_only": T_e, "T_rocket_only": T_r, "T_hybrid": T_h,
+        "C_elevator_only": cost_elev_only / 1e12, "C_rocket_only": cost_rock_only / 1e12, "C_hybrid": cost_hybrid / 1e12,
+        "E_elevator_only": co2_elev_only / 1e9, "E_rocket_only": co2_rock_only / 1e9, "E_hybrid": (co2_hybrid_e + co2_hybrid_r) / 1e9,
+        "Rocket_launches_per_year": L_year
+    }
+
+# =============================
+# 3) Ranges for bivariate sweeps
+# =============================
+def get_range(sym, base_val, default_pct=0.20):
+    raw = p_raw.get(sym, None)
+    if isinstance(raw, tuple):
+        return float(raw[0]), float(raw[1]), float(base_val)
+    lo = float(base_val) * (1 - default_pct)
+    hi = float(base_val) * (1 + default_pct)
+    if lo <= 0:
+        lo = float(base_val) * 0.50
+    return lo, hi, float(base_val)
+
+# =============================
+# 4) Bivariate grid + auto-expand to make contour exist
+# =============================
+def bivariate_ratio(sym_x, sym_y, out_key, nx=31, ny=31, rocket_fuel="ch4",
+                    x_lo=None, x_hi=None, y_lo=None, y_hi=None):
+    base_out = eval_outputs(p_base, **scenario_base, rocket_fuel=rocket_fuel)
+    base_val = base_out[out_key]
+
+    x0 = p_base[sym_x]
+    y0 = p_base[sym_y]
+
+    if x_lo is None or x_hi is None:
+        x_lo0, x_hi0, _ = get_range(sym_x, x0)
+        x_lo = x_lo0 if x_lo is None else x_lo
+        x_hi = x_hi0 if x_hi is None else x_hi
+
+    if y_lo is None or y_hi is None:
+        y_lo0, y_hi0, _ = get_range(sym_y, y0)
+        y_lo = y_lo0 if y_lo is None else y_lo
+        y_hi = y_hi0 if y_hi is None else y_hi
+
+    xs = np.linspace(x_lo, x_hi, nx)
+    ys = np.linspace(y_lo, y_hi, ny)
+
+    Z_abs = np.zeros((ny, nx))
+    for i, yv in enumerate(ys):
+        for j, xv in enumerate(xs):
+            p_tmp = dict(p_base)
+            p_tmp[sym_x] = float(xv)
+            p_tmp[sym_y] = float(yv)
+            out = eval_outputs(p_tmp, **scenario_base, rocket_fuel=rocket_fuel)
+            Z_abs[i, j] = out[out_key]
+
+    Z_ratio = Z_abs / base_val
+    return xs, ys, Z_abs, Z_ratio, base_val
+
+def ensure_contour_exists(sym_x, sym_y, out_key, target_year,
+                          nx=31, ny=31, rocket_fuel="ch4",
+                          max_expand_steps=6, expand_factor=1.25):
+    """
+    If target_year is not within [min, max] of the grid, expand the HIGH bounds
+    (for time, higher capacities reduce time -> helps reach smaller targets like 110).
+    """
+    x0 = p_base[sym_x]
+    y0 = p_base[sym_y]
+    x_lo, x_hi, _ = get_range(sym_x, x0)
+    y_lo, y_hi, _ = get_range(sym_y, y0)
+
+    for step in range(max_expand_steps + 1):
+        xs, ys, Z_abs, Z_ratio, base_val = bivariate_ratio(
+            sym_x, sym_y, out_key, nx=nx, ny=ny, rocket_fuel=rocket_fuel,
+            x_lo=x_lo, x_hi=x_hi, y_lo=y_lo, y_hi=y_hi
+        )
+        tmin, tmax = float(Z_abs.min()), float(Z_abs.max())
+        if tmin <= target_year <= tmax:
+            return xs, ys, Z_abs, Z_ratio, base_val, (x_lo, x_hi, y_lo, y_hi), True
+
+        # If target is smaller than any value (common for 110), expand HIGH bounds
+        if target_year < tmin:
+            x_hi *= expand_factor
+            y_hi *= expand_factor
+        # If target is larger than any value, expand LOW bounds downward
+        elif target_year > tmax:
+            x_lo /= expand_factor
+            y_lo /= expand_factor
+
+    return xs, ys, Z_abs, Z_ratio, base_val, (x_lo, x_hi, y_lo, y_hi), False
+
+def plot_heatmap_ratio_with_contour(xs, ys, Z_ratio, Z_abs,
+                                    sym_x, sym_y,
+                                    title, cbar_label="Output / Baseline",
+                                    contour_year=110.0,
+                                    cmap="YlGnBu"):
+    fig = plt.figure(figsize=(9.2, 6.6))
+    ax = plt.gca()
+
+    im = ax.imshow(
+        Z_ratio, origin="lower", aspect="auto", interpolation="nearest",
+        extent=[xs.min(), xs.max(), ys.min(), ys.max()],
+        cmap=cmap
+    )
+
+    # draw contour if possible
+    tmin, tmax = float(Z_abs.min()), float(Z_abs.max())
+    if tmin <= contour_year <= tmax:
+        cs = ax.contour(xs, ys, Z_abs, levels=[contour_year], colors="k", linewidths=1.4, alpha=0.80)
+        ax.clabel(cs, inline=True, fontsize=12, fmt=lambda v: f"{v:.0f} yr")
+    else:
+        ax.text(
+            0.02, 0.02,
+            f"Contour {contour_year:.0f} yr not reachable\nin current range ({tmin:.1f}–{tmax:.1f} yr)",
+            transform=ax.transAxes, fontsize=12,
+            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="0.7")
+        )
+
+    ax.set_title(title, pad=10)
+    ax.set_xlabel(strip_paren(nice_label(sym_x)))
+    ax.set_ylabel(strip_paren(nice_label(sym_y)))
+
+    cbar = plt.colorbar(im, ax=ax, fraction=0.036, pad=0.03)
+    cbar.set_label(cbar_label)
+
+    plt.tight_layout()
+    plt.show()
+
+def plot_heatmap_ratio_cost(xs, ys, Z_ratio, sym_x, sym_y,
+                            title, cbar_label="Output / Baseline"):
+    base_cmap = cm.get_cmap("YlOrBr")
+    warm_muted = ListedColormap(base_cmap(np.linspace(0.25, 0.95, 256)))
+
+    vmin, vmax = np.quantile(Z_ratio, [0.02, 0.98])
+
+    plt.figure(figsize=(9.2, 6.6))
+    ax = plt.gca()
+    im = ax.imshow(
+        Z_ratio,
+        origin="lower", aspect="auto", interpolation="nearest",
+        extent=[xs.min(), xs.max(), ys.min(), ys.max()],
+        cmap=warm_muted,
+        vmin=vmin, vmax=vmax
+    )
+
+    ax.set_title(title, pad=10)
+    ax.set_xlabel(strip_paren(nice_label(sym_x)))
+    ax.set_ylabel(strip_paren(nice_label(sym_y)))
+
+    cbar = plt.colorbar(im, ax=ax, fraction=0.036, pad=0.03)
+    cbar.set_label(cbar_label)
+
+    plt.tight_layout()
+    plt.show()
+
+# =============================
+# 5) Produce figures
+# =============================
+
+# ---- (A) TIME with 110-year contour (auto-expand if needed) ----
+target_year = 110.0
+xs, ys, Zt_abs, Zt_ratio, T_base, used_ranges, ok = ensure_contour_exists(
+    sym_x="m_payload_rocket",
+    sym_y="C_elev",
+    out_key="T_hybrid",
+    target_year=target_year,
+    nx=31, ny=31,
+    max_expand_steps=6, expand_factor=1.25
+)
+print("Baseline Hybrid Time (years):", T_base)
+print("Time grid range (years):", float(Zt_abs.min()), float(Zt_abs.max()))
+print("Used ranges (x_lo, x_hi, y_lo, y_hi):", used_ranges)
+print("Contour reachable:", ok)
+
+plot_heatmap_ratio_with_contour(
+    xs, ys, Zt_ratio, Zt_abs,
+    sym_x="m_payload_rocket",
+    sym_y="C_elev",
+    title="Bivariate Sensitivity (Relative) — Hybrid Completion Time",
+    cbar_label="Time / Baseline time",
+    contour_year=target_year
+)
+
+# ---- (B) COST heatmap (relative baseline) ----
+xs, ys, Zc_abs, Zc_ratio, C_base = bivariate_ratio(
+    sym_x="m_TLI_SLS_B1",
+    sym_y="c_LEO_reuse_200",
+    out_key="C_hybrid",
+    nx=31, ny=31
+)
+print("Baseline Hybrid Cost (trillion USD):", C_base)
+
+plot_heatmap_ratio_cost(
+    xs, ys, Zc_ratio,
+    sym_x="m_TLI_SLS_B1",
+    sym_y="c_LEO_reuse_200",
+    title="Bivariate Sensitivity (Relative) — Hybrid Total Cost",
+    cbar_label="Cost / Baseline cost"
+)
