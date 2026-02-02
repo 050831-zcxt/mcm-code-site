@@ -62,7 +62,7 @@ def simulate(mode='hybrid', target_years=150):
         unit_c_r = get_rocket_unit_cost(cum_mass)
         unit_c_e = OPEX_ELEV_BASE * mass_ratio(DV_APEX_TO_MOON)
 
-        annual_cost = (m_e * unit_c_e + m_r * unit_c_r) * 1000  # 吨转kg
+        annual_cost = (m_e * unit_c_e + m_r * unit_c_r) * 1000  
         cum_mass += (m_e + m_r)
 
         history.append({
@@ -279,13 +279,7 @@ def _fallback_plan_from_constants(
     hybrid_share_elevator: float = 0.3,
     horizon_years: int = 600,
 ) -> AnnualPlan:
-    """
-    Fallback if 参数.xlsx doesn't have a year-by-year plan.
-    Uses constant annual capacities, chosen to be consistent with typical deterministic results.
 
-    elevator_cap=179k/yr matches: 100M / 179k ≈ 559 years (as in many baseline solutions).
-    rocket_cap default uses 100M / 183 ≈ 546k/yr (commonly derived from sample comparisons).
-    """
     years = np.arange(horizon_years, dtype=int)
 
     if scenario.lower() == "elevator":
@@ -954,12 +948,7 @@ b_wright = math.log(f_lc) / math.log(2)  # negative if learning occurs
 # 4) Environment & cost evaluators
 # =============================
 def label_bars(ax, bars, fmt="{:.2f}", pad=3, fontsize=10):
-    """
-    ax: matplotlib axis
-    bars: ax.bar(...) 返回的 BarContainer
-    fmt: 数值格式，如 "{:.0f}" "{:.2f}"
-    pad: 标签离柱顶的像素距离
-    """
+
     for b in bars:
         h = b.get_height()
         if np.isnan(h):
